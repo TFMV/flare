@@ -212,24 +212,213 @@ class IcebergPersistence:
     def _get_data_files_from_parquet(
         self, parquet_file: str, table: "IcebergTable"
     ) -> List[Dict[str, Any]]:
-        """Extract data files from a Parquet file for appending to an Iceberg table."""
-        # This is a simplified approach - in a real implementation, you would:
-        # 1. Read the file's metadata
-        # 2. Determine partitioning
-        # 3. Create appropriate data file records for Iceberg
+        """
+        Extract data files from a Parquet file for appending to an Iceberg table.
 
-        # Placeholder implementation - in a real case, this would need to be expanded
-        # with proper handling of partitioning and file statistics
-        return [
-            {
-                "content": 0,  # 0 for data, 1 for delete, etc.
-                "file_path": parquet_file,
-                "file_format": "PARQUET",
-                "partition": {},  # Partitioning info
-                "record_count": pq.read_metadata(parquet_file).num_rows,
-                "file_size_in_bytes": os.path.getsize(parquet_file),
-            }
-        ]
+        This method prepares Parquet files for addition to an Iceberg table, handling:
+        1. File metadata extraction
+        2. Partition determination
+        3. Column statistics calculation
+        4. Proper file format for Iceberg's append operation
+
+        Args:
+            parquet_file: Path to the Parquet file
+            table: Iceberg table to append to
+
+        Returns:
+            List of data file dictionaries ready for Iceberg append operation
+        """
+        import pandas as pd
+        from pyiceberg.io.pyarrow import PyArrowFileIO
+        from pyiceberg.partitioning import PartitionField, PartitionSpec
+        from pyiceberg.transforms import IdentityTransform, Transform
+        from pyiceberg.expressions import Reference
+
+        # Get file statistics
+        metadata = pq.read_metadata(parquet_file)
+        file_size = os.path.getsize(parquet_file)
+        record_count = metadata.num_rows
+
+        # Load table's partition spec
+        partition_spec = table.spec()
+
+        # Read table metadata to determine location
+        table_location = table.location()
+        io = PyArrowFileIO()
+
+        # If the table has partitioning, we need to determine partition values
+        partition_values = {}
+
+        if partition_spec and partition_spec.fields:
+            # Read the data to determine partition values
+            # For large files, we might only read a small sample
+            if record_count > 10000:
+                table_sample = pq.read_table(
+                    parquet_file,
+                    columns=[field.name for field in partition_spec.fields],
+                )
+                df_sample = table_sample.to_pandas()
+            else:
+                df = pd.read_parquet(parquet_file)
+                df_sample = df
+
+            # Determine partition values from the data
+            for field in partition_spec.fields:
+                source_column = field.source_id
+                source_name = table.schema().find_field(source_column).name
+
+                if source_name in df_sample.columns:
+                    # Apply transformation according to partition transforms
+                    transform = field.transform
+
+                    if isinstance(transform, IdentityTransform):
+                        # For identity transforms, take the first value (assuming all rows have same partition value)
+                        partition_values[field.name] = df_sample[source_name].iloc[0]
+                    else:
+                        # Handle other transforms (year, month, day, bucket, truncate)
+                        transform_name = transform.__class__.__name__.lower()
+
+                        if transform_name == "yeartransform":
+                            year = pd.to_datetime(df_sample[source_name].iloc[0]).year
+                            partition_values[field.name] = year
+                        elif transform_name == "monthtransform":
+                            month = pd.to_datetime(df_sample[source_name].iloc[0]).month
+                            partition_values[field.name] = month
+                        elif transform_name == "daytransform":
+                            day = pd.to_datetime(df_sample[source_name].iloc[0]).day
+                            partition_values[field.name] = day
+                        elif transform_name == "hourtransform":
+                            hour = pd.to_datetime(df_sample[source_name].iloc[0]).hour
+                            partition_values[field.name] = hour
+                        elif "bucket" in transform_name:
+                            # Simplified bucketing logic
+                            bucket_value = (
+                                hash(str(df_sample[source_name].iloc[0])) % transform.n
+                            )
+                            partition_values[field.name] = bucket_value
+                        elif "truncate" in transform_name:
+                            # Simplified truncate logic
+                            width = transform.width
+                            val = df_sample[source_name].iloc[0]
+                            if isinstance(val, (int, float)):
+                                partition_values[field.name] = val - (val % width)
+                            else:
+                                partition_values[field.name] = str(val)[:width]
+
+        # Construct a relative file path based on partitioning
+        relative_file_path = ""
+        if partition_values:
+            # Construct partition path
+            partition_path_parts = []
+            for name, value in partition_values.items():
+                formatted_value = str(value).replace("/", "_")  # sanitize for paths
+                partition_path_parts.append(f"{name}={formatted_value}")
+
+            partition_dir = "/".join(partition_path_parts)
+
+            # Relative path within the table
+            relative_file_path = (
+                f"data/{partition_dir}/{os.path.basename(parquet_file)}"
+            )
+        else:
+            # Non-partitioned tables
+            relative_file_path = f"data/{os.path.basename(parquet_file)}"
+
+        # Calculate the final file path
+        final_file_path = os.path.join(table_location, relative_file_path)
+
+        # Move the file to its final location
+        os.makedirs(os.path.dirname(final_file_path), exist_ok=True)
+
+        # Use PyArrow FileSystem for copying to handle various file systems
+        fs, src_path = pa.fs.FileSystem.from_uri(parquet_file)
+        dest_fs, dest_path = pa.fs.FileSystem.from_uri(final_file_path)
+
+        # Copy the file
+        with fs.open_input_file(src_path) as src_file:
+            with dest_fs.open_output_stream(dest_path) as dest_file:
+                # Use a reasonable buffer size
+                buffer_size = 8 * 1024 * 1024  # 8 MB
+                while True:
+                    buf = src_file.read(buffer_size)
+                    if not buf:
+                        break
+                    dest_file.write(buf)
+
+        # Compute columnar statistics for each field in Iceberg schema
+        column_stats = {}
+
+        # Only compute statistics for primitive types
+        for field in table.schema().fields:
+            field_id = field.field_id
+            field_name = field.name
+
+            # Skip complex types for statistics
+            if field.field_type.__class__.__name__ in (
+                "StructType",
+                "ListType",
+                "MapType",
+            ):
+                continue
+
+            # Check if field exists in the parquet file
+            if field_name in [col_name for col_name in metadata.schema.names]:
+                col_idx = metadata.schema.get_field_index(field_name)
+
+                # Extract column statistics from Parquet metadata
+                col_stats = {}
+
+                for row_group_idx in range(metadata.num_row_groups):
+                    row_group = metadata.row_group(row_group_idx)
+                    if row_group.column(col_idx).statistics:
+                        stats = row_group.column(col_idx).statistics
+
+                        # Update min/max
+                        if stats.has_min_max_values:
+                            if "min" not in col_stats or stats.min < col_stats["min"]:
+                                col_stats["min"] = stats.min
+                            if "max" not in col_stats or stats.max > col_stats["max"]:
+                                col_stats["max"] = stats.max
+
+                        # Update null count
+                        if stats.has_null_count:
+                            if "null_count" not in col_stats:
+                                col_stats["null_count"] = stats.null_count
+                            else:
+                                col_stats["null_count"] += stats.null_count
+
+                # If we have statistics, add them
+                if col_stats:
+                    column_stats[field_id] = col_stats
+
+        # Create data file dictionary for Iceberg
+        data_file = {
+            "content": 0,  # 0 for data, 1 for delete, etc.
+            "file_path": final_file_path,
+            "file_format": "PARQUET",
+            "partition": partition_values,
+            "record_count": record_count,
+            "file_size_in_bytes": file_size,
+            "column_sizes": {},  # Would require more detailed Parquet analysis
+            "value_counts": {},  # Would require more detailed Parquet analysis
+            "null_value_counts": {
+                k: v.get("null_count", 0)
+                for k, v in column_stats.items()
+                if "null_count" in v
+            },
+            "nan_value_counts": {},  # Not typically tracked in Parquet
+            "lower_bounds": {
+                k: v.get("min") for k, v in column_stats.items() if "min" in v
+            },
+            "upper_bounds": {
+                k: v.get("max") for k, v in column_stats.items() if "max" in v
+            },
+            "key_metadata": None,
+            "split_offsets": None,
+            "sort_order_id": 0,
+        }
+
+        return [data_file]
 
     def _persist_batch_fallback(self, topic: str, batch: pa.RecordBatch) -> bool:
         """Fallback persistence without pyiceberg - just write Parquet files."""
